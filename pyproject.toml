@@ -1,0 +1,18 @@
+[project]
+name = "pychill"
+version = "0.1.0"
+description = "Chill a little bit while standing in a queue..."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--asyncio-mode=auto",
+]
