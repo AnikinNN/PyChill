@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Chill a little bit while standing in a queue..."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "pydantic>=2.11.7",
+    "redis>=6.2.0",
+]
 
 [dependency-groups]
 dev = [

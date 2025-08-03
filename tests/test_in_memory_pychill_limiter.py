@@ -1,14 +1,14 @@
 from datetime import timedelta
 import pytest
 
-from pychill import PyChillLimiter
+from pychill import InMemoryPyChillLimiter
 from tests.limited_server import LimitedServer, ServerRateLimit
 from tests.utils import reraise_gather
 
 
 async def test_normal():
     server = LimitedServer(10, timedelta(seconds=1))
-    limiter = PyChillLimiter(10, timedelta(seconds=1))
+    limiter = InMemoryPyChillLimiter(rate=10, window=timedelta(seconds=1))
 
     @limiter.decorator
     async def should_be_limited(*args, **kwargs):
@@ -27,7 +27,7 @@ async def test_normal():
 
 async def test_brake_the_limit():
     server = LimitedServer(10, timedelta(seconds=1))
-    limiter = PyChillLimiter(100, timedelta(seconds=1))
+    limiter = InMemoryPyChillLimiter(rate=100, window=timedelta(seconds=1))
 
     @limiter.decorator
     async def should_be_limited(*args, **kwargs):
@@ -44,7 +44,7 @@ async def test_brake_the_limit():
 
 async def test_gather():
     server = LimitedServer(10, timedelta(seconds=1))
-    limiter = PyChillLimiter(10, timedelta(seconds=1))
+    limiter = InMemoryPyChillLimiter(rate=10, window=timedelta(seconds=1))
 
     async def should_be_limited(*args, **kwargs):
         return await server.run(*args, **kwargs)
@@ -62,7 +62,7 @@ async def test_gather():
 
 async def test_gather_brake_the_limit():
     server = LimitedServer(10, timedelta(seconds=1))
-    limiter = PyChillLimiter(100, timedelta(seconds=1))
+    limiter = InMemoryPyChillLimiter(rate=100, window=timedelta(seconds=1))
 
     async def should_be_limited(*args, **kwargs):
         return await server.run(*args, **kwargs)
@@ -76,7 +76,7 @@ async def test_gather_brake_the_limit():
 
 async def test_gather_brake_the_limit_return_exceptions():
     server = LimitedServer(10, timedelta(seconds=1))
-    limiter = PyChillLimiter(100, timedelta(seconds=1))
+    limiter = InMemoryPyChillLimiter(rate=100, window=timedelta(seconds=1))
 
     async def should_be_limited(*args, **kwargs):
         return await server.run(*args, **kwargs)
