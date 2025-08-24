@@ -1,3 +1,3 @@
 from .base import BasePyChillLimiter
 from .in_memory_pychill import InMemoryPyChillLimiter
-from .redis_pychill import RedisPyChillConfig, RedisPyChillLimiter, RedisPyChillLimiterEventTypes, RedisPyChillConfigNames
+from pychill.redis.redis_pychill import RedisPyChillConfig, RedisPyChillLimiter, EventTypes, RedisPyChillConfigNames
