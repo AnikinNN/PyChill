@@ -1,167 +1,18 @@
 import asyncio
 import uuid
-from datetime import timedelta, datetime, timezone
-from enum import StrEnum, auto
-from functools import wraps
 from logging import getLogger, Logger
-from typing import Self, Awaitable, Any, Literal, Callable
+from typing import Self, Awaitable, Any, Callable
 
-from pydantic import Field, BaseModel, ValidationError, PrivateAttr
+from pydantic import Field, PrivateAttr
 from redis.asyncio import Redis
 from redis.commands.timeseries import TSInfo
 
+from pychill.redis.config import RedisPyChillConfig
 from pychill.base import BasePyChillLimiter
+from pychill.redis.events import EventTypes, LimiterEvent, RunEvent, InviteEvent, WaitingEvent, event_validate, BaseEvent
+from pychill.redis.utils import await_cancelled, td_to_tdms, ts_to_dt, dt_to_ts, log_error, get_now
 
 logger = getLogger(__name__)
-
-
-class RedisPyChillConfigNames(BaseModel):
-    base: str = Field(default="pychill", description="Name of limiter. Must be unique for every Redis limited")
-    lock: str = Field(default="lock", description="Key that is used for lock")
-    stream: str = Field(default="stream", description="Key that is used for stream")
-    queue: str = Field(default="queue", description="Key that is used for queue")
-    time_series: str = Field(default="time_series", description="Key that is used for time series")
-    config: str = Field(default="config", description="Key that is used for config hash")
-
-    @property
-    def full_lock(self):
-        return f"{self.base}:{self.lock}"
-
-    @property
-    def full_stream(self):
-        return f"{self.base}:{self.stream}"
-
-    @property
-    def full_queue(self):
-        return f"{self.base}:{self.queue}"
-
-    @property
-    def full_time_series(self):
-        return f"{self.base}:{self.time_series}"
-
-    @property
-    def full_config(self):
-        return f"{self.base}:{self.config}"
-
-
-class RedisPyChillConfig(BaseModel):
-    names: RedisPyChillConfigNames = Field(default_factory=RedisPyChillConfigNames)
-    ack_timeout: timedelta = Field(default=timedelta(seconds=10))
-    leader_heartbeat_timeout: timedelta = Field(default=timedelta(seconds=10))
-    leader_heartbeat_alpha: float = Field(
-        default=0.95,
-        description="time to treat current leader dead is `leader_heartbeat_timeout`, so heartbeat must be a little bit earlier",
-        gt=0,
-        lt=1.0,
-    )
-    leader_page: int = Field(default=10, ge=1, )
-
-
-class EventTypes(StrEnum):
-    # per limiter
-    limiter_configured = auto()
-    heartbeat = auto()
-
-    # per run
-    run_created = auto()
-    invite = auto()
-    ack = auto()
-    waiting = auto()
-    started = auto()
-    finished = auto()
-    dropped = auto()
-
-
-class BaseEvent(BaseModel):
-    type: EventTypes
-    limiter_id: str
-
-
-class LimiterEvent(BaseEvent):
-    type: Literal[
-        EventTypes.limiter_configured,
-        EventTypes.heartbeat,
-    ]
-    limiter_id: str
-
-
-class RunEvent(LimiterEvent):
-    type: Literal[
-        EventTypes.run_created,
-        EventTypes.ack,
-        EventTypes.started,
-        EventTypes.finished,
-        EventTypes.dropped,
-    ]
-    run_id: str
-
-
-class InviteEvent(RunEvent):
-    type: Literal[EventTypes.invite]
-    invited_id: str
-
-
-class WaitingEvent(RunEvent):
-    type: Literal[EventTypes.waiting]
-    waiting_for: timedelta
-
-
-def event_validate(data: dict[bytes, bytes]) -> LimiterEvent:
-    data = bytes_dict_decode(data)
-    # the order is sufficient, LimiterEvent must be the last
-    for klass in (
-            WaitingEvent,
-            InviteEvent,
-            RunEvent,
-            LimiterEvent,
-    ):
-        try:
-            return klass.model_validate(data)
-        except ValidationError:
-            pass
-    raise ValidationError(f"data didn't match any model:\n{data=}")
-
-
-class AutoClearEvent:
-    def __init__(self, logger_: Logger = logger):
-        self.event = asyncio.Event()
-        self.payload: LimiterEvent | RunEvent | InviteEvent | WaitingEvent | None = None
-        self.logger = logger_
-
-    def set(self, payload: LimiterEvent):
-        if self.payload and payload.type != EventTypes.run_created:
-            self.logger.warning(
-                f"Payload replacement detected:\n"
-                f"Old: {self.payload}\n"
-                f"New: {payload}"
-            )
-        self.payload = payload
-        self.event.set()
-
-    async def wait_and_clear(self) -> LimiterEvent:
-        """Wait for the event and clear it immediately after. Return payload"""
-        await self.event.wait()
-        self.event.clear()
-        result = self.payload
-        self.payload = None
-        return result
-
-    async def wait(self) -> LimiterEvent:
-        """Wait for the event. Return payload"""
-        await self.event.wait()
-        return self.payload
-
-    def clear(self):
-        """Clear event."""
-        self.event.clear()
-        self.payload = None
-
-
-def bytes_dict_decode(data: dict[bytes, bytes]) -> dict[str, str]:
-    new = dict()
-    for k, v in data.items():
-        new[k.decode()] = v.decode()
-    return new
 
 
 class RedisPyChillLimiter(BasePyChillLimiter):
@@ -178,18 +29,6 @@ class RedisPyChillLimiter(BasePyChillLimiter):
 
     def model_post_init(self, context: Any, /) -> None:
         self._stop_event = asyncio.Event()
-
-    @staticmethod
-    def log_error(func):
-        @wraps(func)
-        async def log_error_wrapper(self, *args, **kwargs):
-            try:
-                return await func(self, *args, **kwargs)
-            except Exception as e:
-                self.logger.exception(e)
-                raise
-
-        return log_error_wrapper
 
     async def __aenter__(self) -> Self:
         self._subscriber_task = asyncio.create_task(self.subscribe())
@@ -219,8 +58,8 @@ class RedisPyChillLimiter(BasePyChillLimiter):
     def convert_condition(func):
         async def convert_condition_wrapper(
                 self,
-                condition: Callable[[LimiterEvent], bool] | EventTypes
-        ) -> LimiterEvent:
+                condition: Callable[[BaseEvent], bool] | EventTypes
+        ) -> BaseEvent:
             if isinstance(condition, EventTypes):
                 def a(x):
                     return x.type == condition
@@ -234,7 +73,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
         return convert_condition_wrapper
 
     @convert_condition
-    async def wait_for_event(self, condition: Callable[[LimiterEvent], bool] | EventTypes) -> LimiterEvent:
+    async def wait_for_event(self, condition: Callable[[BaseEvent], bool] | EventTypes) -> BaseEvent:
         f = asyncio.create_task(self.wait_for_event_forward(condition))
         b = asyncio.create_task(self.wait_for_event_backward(condition))
 
@@ -248,17 +87,17 @@ class RedisPyChillLimiter(BasePyChillLimiter):
                 return await f
             else:
                 f.cancel()
-                await self.await_cancelled(f)
+                await await_cancelled(f)
                 return b_res
         elif f in done:
             b.cancel()
-            await self.await_cancelled(b)
+            await await_cancelled(b)
             return await f
         else:
             raise RuntimeError(f'Impossible state: {done=}')
 
     @convert_condition
-    async def wait_for_event_backward(self, condition: Callable[[LimiterEvent], bool]) -> LimiterEvent | None:
+    async def wait_for_event_backward(self, condition: Callable[[BaseEvent], bool]) -> BaseEvent | None:
         cursor = '+'
         while True:
             raw_events = await self.redis.xrevrange(
@@ -278,7 +117,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
                     return i
 
     @convert_condition
-    async def wait_for_event_forward(self, condition: Callable[[LimiterEvent], bool]) -> LimiterEvent:
+    async def wait_for_event_forward(self, condition: Callable[[BaseEvent], bool]) -> BaseEvent:
         cursor = '$'
         while True:
             raw_event = await self.redis.xread(
@@ -323,7 +162,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
             self.config.names.full_lock,
             self.id,
             nx=True,
-            px=self.td_to_tdms(self.config.leader_heartbeat_timeout),
+            px=td_to_tdms(self.config.leader_heartbeat_timeout),
         )
         return bool(res)
 
@@ -422,7 +261,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
         if not ts_exists:
             await self.redis.ts().create(
                 self.config.names.full_time_series,
-                retention_msecs=self.td_to_tdms(self.window),
+                retention_msecs=td_to_tdms(self.window),
                 # todo set duplicate_policy
             )
 
@@ -446,41 +285,11 @@ class RedisPyChillLimiter(BasePyChillLimiter):
     async def stop_manager(self):
         self._stop_event.set()
 
-    async def emit_event(self, event: LimiterEvent):
+    async def emit_event(self, event: BaseEvent):
         return await self.redis.xadd(
             self.config.names.full_stream,
             event.model_dump(mode='json'),
         )
-
-    @staticmethod
-    def dt_to_ts(dt: datetime):
-        return int(dt.timestamp() * 1000)
-
-    @staticmethod
-    def ts_to_dt(ts: int):
-        return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-
-    @staticmethod
-    def td_to_tdms(td: timedelta):
-        return int(td.total_seconds() * 1000)
-
-    @staticmethod
-    def tdms_to_td(tdms: int):
-        return timedelta(milliseconds=tdms)
-
-    @staticmethod
-    def now() -> datetime:
-        return datetime.now(timezone.utc)
-
-    @staticmethod
-    async def await_cancelled(coro):
-        try:
-            await coro
-            raise RuntimeError('Not cancelled')
-        except asyncio.CancelledError:
-            pass
-        except:
-            raise
 
     @log_error
     async def run(self, awaitable, ):
@@ -525,11 +334,11 @@ class RedisPyChillLimiter(BasePyChillLimiter):
 
         while True:
             # remove expired items from time_series
-            now = self.now()
+            now = get_now()
             deleted = await self.redis.ts().delete(
                 key=self.config.names.full_time_series,
                 from_time=0,
-                to_time=self.dt_to_ts(now - self.window),
+                to_time=dt_to_ts(now - self.window),
             )
             self.logger.debug(f"deleted from ts: {deleted}")
 
@@ -542,7 +351,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
             # if no room, sleep a little bit
             oldest_ts = await self.redis.ts().range(self.config.names.full_time_series, '-', '+', 1, )
             oldest_ts = oldest_ts[0][0]
-            oldest_ts = self.ts_to_dt(oldest_ts)
+            oldest_ts = ts_to_dt(oldest_ts)
             time_to_sleep = self.window - (now - oldest_ts)
             self.logger.debug(f'sleep for {time_to_sleep.total_seconds()} seconds before run an {awaitable=}')
             await self.emit_event(

@@ -3,7 +3,7 @@ from collections import deque
 from datetime import timedelta, datetime
 
 
-class ServerRateLimit(Exception):
+class ServerRateLimitError(Exception):
     pass
 
 
@@ -21,7 +21,7 @@ class LimitedServer:
             self.in_deque.popleft()
 
         if len(self.in_deque) > self.rate:
-            raise ServerRateLimit()
+            raise ServerRateLimitError()
 
         self.in_deque.append(now)
         await asyncio.sleep(0.1)
