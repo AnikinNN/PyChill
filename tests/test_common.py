@@ -31,7 +31,7 @@ many_bad_limiters = pytest.mark.parametrize(
 
 @many_limiters
 @with_timeout(timeout=15)
-async def test_normal(limited_server, unwrap_limiter):
+async def test_normal(limited_server, unwrap_limiter, good_rl):
     @unwrap_limiter.decorator
     async def should_be_limited(*args, **kwargs):
         return await limited_server.run(*args, **kwargs)
@@ -40,7 +40,7 @@ async def test_normal(limited_server, unwrap_limiter):
     for _ in range(2):
         r = await reraise_gather(*(
             should_be_limited(i)
-            for i in range(30)
+            for i in range(good_rl.rate * 3)
         ))
         res.extend(r)
 
@@ -49,7 +49,7 @@ async def test_normal(limited_server, unwrap_limiter):
 
 @many_bad_limiters
 @with_timeout(timeout=15)
-async def test_brake_the_limit(limited_server, unwrap_limiter):
+async def test_brake_the_limit(limited_server, unwrap_limiter, bad_rl):
     @unwrap_limiter.decorator
     async def should_be_limited(*args, **kwargs):
         return await limited_server.run(*args, **kwargs)
@@ -57,7 +57,7 @@ async def test_brake_the_limit(limited_server, unwrap_limiter):
     with pytest.raises(ExceptionGroup) as e:
         await reraise_gather(*(
             should_be_limited(i)
-            for i in range(30)
+            for i in range(bad_rl.rate)
         ))
 
     assert all(map(lambda x: isinstance(x, ServerRateLimitError), e.value.exceptions))
@@ -65,7 +65,7 @@ async def test_brake_the_limit(limited_server, unwrap_limiter):
 
 @many_limiters
 @with_timeout(timeout=15)
-async def test_gather(limited_server, unwrap_limiter):
+async def test_gather(limited_server, unwrap_limiter, good_rl):
     async def should_be_limited(*args, **kwargs):
         return await limited_server.run(*args, **kwargs)
 
@@ -73,7 +73,7 @@ async def test_gather(limited_server, unwrap_limiter):
     for _ in range(2):
         r = await unwrap_limiter.gather(*(
             should_be_limited(i)
-            for i in range(30)
+            for i in range(good_rl.rate * 3)
         ))
         res.extend(r)
 
@@ -82,20 +82,20 @@ async def test_gather(limited_server, unwrap_limiter):
 
 @many_bad_limiters
 @with_timeout(timeout=15)
-async def test_gather_brake_the_limit(limited_server, unwrap_limiter):
+async def test_gather_brake_the_limit(limited_server, unwrap_limiter, bad_rl):
     async def should_be_limited(*args, **kwargs):
         return await limited_server.run(*args, **kwargs)
 
     with pytest.raises(ServerRateLimitError):
         await unwrap_limiter.gather(*(
             should_be_limited(i)
-            for i in range(30)
+            for i in range(bad_rl.rate)
         ))
 
 
 @many_bad_limiters
 @with_timeout(timeout=15)
-async def test_gather_brake_the_limit_return_exceptions(limited_server, unwrap_limiter):
+async def test_gather_brake_the_limit_return_exceptions(limited_server, unwrap_limiter, bad_rl):
     async def should_be_limited(*args, **kwargs):
         return await limited_server.run(*args, **kwargs)
 
@@ -104,7 +104,7 @@ async def test_gather_brake_the_limit_return_exceptions(limited_server, unwrap_l
         r = await unwrap_limiter.gather(
             *(
                 should_be_limited(i)
-                for i in range(30)
+                for i in range(bad_rl.rate)
             ),
             return_exceptions=True,
         )
@@ -113,8 +113,8 @@ async def test_gather_brake_the_limit_return_exceptions(limited_server, unwrap_l
     errors = list(filter(lambda x: isinstance(x, Exception), res))
     normal_results = list(filter(lambda x: not isinstance(x, Exception), res))
 
-    assert all(map(lambda x: isinstance(x, ServerRateLimitError), errors))
-    assert all(map(lambda x: isinstance(x, str), normal_results))
+    assert all(isinstance(x, ServerRateLimitError) for x in errors)
+    assert all(isinstance(x, str) for x in normal_results)
 
 
 @many_limiters

@@ -3,11 +3,13 @@ from collections import deque
 from datetime import datetime
 from logging import getLogger, Logger
 from typing import Any
+
 from pydantic import Field
 
 from pychill.base import BasePyChillLimiter
 
 logger = getLogger(__name__)
+
 
 class InMemoryPyChillLimiter(BasePyChillLimiter):
     logger: Logger = Field(default=logger)
@@ -53,9 +55,7 @@ class InMemoryPyChillLimiter(BasePyChillLimiter):
         self.processing_deque.append(now)
 
         self.logger.debug(f"run {awaitable=}")
-        try:
-            return await awaitable
-        finally:
-            # call successors if present
-            if len(self.in_queue):
-                self.in_queue[-1].set()
+        # call successors if present
+        if len(self.in_queue):
+            self.in_queue[-1].set()
+        return await awaitable

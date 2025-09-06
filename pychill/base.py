@@ -1,10 +1,10 @@
 import asyncio
 import math
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
 from datetime import timedelta
 from logging import getLogger, Logger
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = getLogger(__name__)
 
@@ -24,6 +24,7 @@ class BasePyChillLimiter(BaseModel, ABC):
     def decorator(self, func):
         async def wrapper(*args, **kwargs):
             return await self.run(func(*args, **kwargs))
+
         return wrapper
 
     async def gather(self, *awaitables, return_exceptions=False):
@@ -35,4 +36,3 @@ class BasePyChillLimiter(BaseModel, ABC):
     @abstractmethod
     async def run(self, awaitable, ):
         pass
-

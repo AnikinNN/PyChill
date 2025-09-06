@@ -3,7 +3,6 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel
 
 from tests.limited_server import LimitedServer
 from tests.utils import RateLimit
@@ -15,14 +14,14 @@ pytest_plugins = ['tests.plugins.redis_plugins', 'tests.plugins.in_memory_plugin
 @pytest.fixture
 def good_rl():
     return RateLimit(
-        rate=10,
+        rate=100,
         window=timedelta(seconds=1),
     )
 
 @pytest.fixture
 def bad_rl():
     return RateLimit(
-        rate=100,
+        rate=200,
         window=timedelta(seconds=1),
     )
 
@@ -32,5 +31,5 @@ def print_newline_after_start():
 
 
 @pytest.fixture
-def limited_server():
-    return LimitedServer(10, timedelta(seconds=1))
+def limited_server(good_rl):
+    return LimitedServer(good_rl.rate, timedelta(seconds=1))

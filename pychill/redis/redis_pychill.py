@@ -1,16 +1,18 @@
 import asyncio
 import uuid
 from logging import getLogger, Logger
-from typing import Self, Awaitable, Any, Callable
+from typing import Any, Awaitable, Self
 
 from pydantic import Field, PrivateAttr
 from redis.asyncio import Redis
 from redis.commands.timeseries import TSInfo
 
-from pychill.redis.config import RedisPyChillConfig
 from pychill.base import BasePyChillLimiter
-from pychill.redis.events import EventTypes, LimiterEvent, RunEvent, InviteEvent, WaitingEvent, event_validate, BaseEvent
-from pychill.redis.utils import await_cancelled, td_to_tdms, ts_to_dt, dt_to_ts, log_error, get_now
+from pychill.redis.config import RedisPyChillConfig
+from pychill.redis.events import BaseEvent, event_validate, EventTypes, InviteEvent, LimiterEvent, RunEvent, \
+    WaitingEvent
+from pychill.redis.stream_copy import RSCQueue
+from pychill.redis.utils import dt_to_ts, get_now, log_error, td_to_tdms, ts_to_dt
 
 logger = getLogger(__name__)
 
@@ -26,9 +28,11 @@ class RedisPyChillLimiter(BasePyChillLimiter):
     _subscriber_task: Awaitable = PrivateAttr()
 
     _stop_event: asyncio.Event = PrivateAttr()
+    _stream_copy: RSCQueue = PrivateAttr()
 
     def model_post_init(self, context: Any, /) -> None:
         self._stop_event = asyncio.Event()
+        self._stream_copy = RSCQueue()
 
     async def __aenter__(self) -> Self:
         self._subscriber_task = asyncio.create_task(self.subscribe())
@@ -52,84 +56,9 @@ class RedisPyChillLimiter(BasePyChillLimiter):
             )
             event = event_validate(raw_event[0][1][0][1])
             cursor = raw_event[0][1][0][0]
+            self._stream_copy.append(event)
             self.logger.debug(f"subscribe: {event=}")
-
-    @staticmethod
-    def convert_condition(func):
-        async def convert_condition_wrapper(
-                self,
-                condition: Callable[[BaseEvent], bool] | EventTypes
-        ) -> BaseEvent:
-            if isinstance(condition, EventTypes):
-                def a(x):
-                    return x.type == condition
-
-                new_condition = a
-            else:
-                new_condition = condition
-
-            return await func(self, new_condition)
-
-        return convert_condition_wrapper
-
-    @convert_condition
-    async def wait_for_event(self, condition: Callable[[BaseEvent], bool] | EventTypes) -> BaseEvent:
-        f = asyncio.create_task(self.wait_for_event_forward(condition))
-        b = asyncio.create_task(self.wait_for_event_backward(condition))
-
-        done, _ = await asyncio.wait([f, b], return_when=asyncio.FIRST_COMPLETED)
-        if len(done) != 1:
-            return await f
-
-        if b in done:
-            b_res = await b
-            if b_res is None:
-                return await f
-            else:
-                f.cancel()
-                await await_cancelled(f)
-                return b_res
-        elif f in done:
-            b.cancel()
-            await await_cancelled(b)
-            return await f
-        else:
-            raise RuntimeError(f'Impossible state: {done=}')
-
-    @convert_condition
-    async def wait_for_event_backward(self, condition: Callable[[BaseEvent], bool]) -> BaseEvent | None:
-        cursor = '+'
-        while True:
-            raw_events = await self.redis.xrevrange(
-                name=self.config.names.full_stream,
-                max=cursor,
-                min='-',
-                count=self.config.leader_page,
-            )
-            events = [event_validate(i) for _, i in raw_events]
-            if len(events) == 0:
-                # stream ended
-                return None
-            cursor = b'(' + raw_events[0][0]
-
-            for i in events:
-                if condition(i):
-                    return i
-
-    @convert_condition
-    async def wait_for_event_forward(self, condition: Callable[[BaseEvent], bool]) -> BaseEvent:
-        cursor = '$'
-        while True:
-            raw_event = await self.redis.xread(
-                streams={self.config.names.full_stream: cursor},
-                count=1,
-                block=0,
-            )
-            cursor = raw_event[0][1][0][0]
-            event = event_validate(raw_event[0][1][0][1])
-
-            if condition(event):
-                return event
+            # todo add new event type and clean stream copy on stream cut
 
     @log_error
     async def leadership_watchdog_task(self):
@@ -140,7 +69,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
         while True:
             try:
                 async with asyncio.timeout(self.config.leader_heartbeat_timeout.total_seconds()):
-                    await self.wait_for_event_forward(EventTypes.heartbeat)
+                    await self._stream_copy.find_forward(EventTypes.heartbeat)
                     self.logger.debug(f"leadership_watchdog_task: track alive leader")
 
             except TimeoutError:
@@ -170,7 +99,7 @@ class RedisPyChillLimiter(BasePyChillLimiter):
     async def assert_remote_config(self):
         raw_remote_config = await self.redis.get(self.config.names.full_config)
         if not raw_remote_config:
-            await self.wait_for_event_forward(EventTypes.limiter_configured)
+            await self._stream_copy.find(EventTypes.limiter_configured)
             raw_remote_config = await self.redis.get(self.config.names.full_config)
 
         remote_config = RedisPyChillConfig.model_validate_json(raw_remote_config)
@@ -200,10 +129,18 @@ class RedisPyChillLimiter(BasePyChillLimiter):
     async def drop_watchdog(self):
         self.logger.debug(f"drop_watchdog: started")
 
+        cursor = self._stream_copy.last_node
+
         # find last invite_event or ack_event
-        ack_or_invite_event = await self.wait_for_event_backward(
-            lambda x: x.type in (EventTypes.invite, EventTypes.ack)
+        found = await self._stream_copy.find_backward(
+            lambda x: x.type in (EventTypes.invite, EventTypes.ack),
+            cursor,
         )
+
+        if found is not None:
+            ack_or_invite_event, _ = found
+        else:
+            ack_or_invite_event = None
 
         old_invite_event = (
             ack_or_invite_event
@@ -216,19 +153,21 @@ class RedisPyChillLimiter(BasePyChillLimiter):
         # todo drop if not waiting
         while True:
             if old_invite_event is None:
-                invite_event: InviteEvent = await self.wait_for_event_forward(EventTypes.invite)
+                invite_event: InviteEvent
+                invite_event, cursor = await self._stream_copy.find_forward(EventTypes.invite, cursor)
             else:
                 invite_event = old_invite_event
                 old_invite_event = None
             try:
                 while True:
                     async with asyncio.timeout(self.config.ack_timeout.total_seconds()):
-                        ack_event: RunEvent = await self.wait_for_event_forward(EventTypes.ack)
+                        ack_event: RunEvent
+                        ack_event, cursor = await self._stream_copy.find_forward(EventTypes.ack, cursor)
                         if invite_event.invited_id == ack_event.run_id:
-                            logger.debug(f"drop_watchdog: expected: {ack_event=}")
+                            self.logger.debug(f"drop_watchdog: expected: {ack_event=}")
                             break
                         else:
-                            logger.debug(f"drop_watchdog: unexpected, but ignored: {ack_event=}")
+                            self.logger.debug(f"drop_watchdog: unexpected, but ignored: {ack_event=}")
             except TimeoutError:
                 # drop
                 pop_id = await self.redis.rpop(self.config.names.full_queue, 1)
@@ -275,6 +214,16 @@ class RedisPyChillLimiter(BasePyChillLimiter):
                     limiter_id=self.id,
                 )
             )
+
+            # todo check that you do not steal lock
+            await self.redis.set(
+                self.config.names.full_lock,
+                self.id,
+                nx=True,
+                px=td_to_tdms(self.config.leader_heartbeat_timeout),
+                get=True,
+            )
+
             await asyncio.sleep(
                 self.config.leader_heartbeat_timeout.total_seconds()
                 *
@@ -312,7 +261,8 @@ class RedisPyChillLimiter(BasePyChillLimiter):
 
         # subscribe to the stream
         while not i_am_invited:
-            event: InviteEvent = await self.wait_for_event(EventTypes.invite)
+            event, _ = await self._stream_copy.find(EventTypes.invite)
+            event: InviteEvent
             i_am_invited = event.invited_id == run_id
 
         # emit ack event

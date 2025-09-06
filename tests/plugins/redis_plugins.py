@@ -2,6 +2,8 @@ from logging import getLogger
 
 import pytest
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 
 from pychill import RedisPyChillLimiter
 
@@ -10,7 +12,7 @@ class LoggerRedis(Redis):
     """
     wrapping original redis to get logs on executed commands
     """
-    logger = getLogger('pychill.redis_logger_')
+    logger = getLogger('pychill.redis_execute')
 
     async def execute_command(self, *args, **options):
         str_args = []
@@ -26,7 +28,19 @@ class LoggerRedis(Redis):
 
 @pytest.fixture
 async def redis_client():
-    async with LoggerRedis(host='localhost', port=6379) as client:
+    async with LoggerRedis(
+            host='localhost',
+            port=6379,
+            retry=Retry(
+                backoff=NoBackoff(),
+                retries=3,
+                supported_errors=(
+                        ConnectionResetError,
+                        ConnectionError,
+                        TimeoutError,
+                )
+            )
+    ) as client:
         yield client
 
 
